@@ -50,9 +50,6 @@
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
-extern volatile uint8_t adc_done;
-extern volatile uint8_t adc_error;
-
 extern UART_HandleTypeDef huart2;
 
 extern HAL_StatusTypeDef Monitor_ADC_Start(void);

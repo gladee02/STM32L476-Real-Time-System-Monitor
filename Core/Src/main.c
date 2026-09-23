@@ -24,15 +24,26 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef struct
+{
+    float temperature_c;
+    uint32_t vdda_mv;
+
+} monitor_measurement_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+#define MONITOR_ADC_DONE_FLAG   (1U << 0)
+#define MONITOR_ADC_ERROR_FLAG  (1U << 1)
 
 /* USER CODE END PD */
 
@@ -62,11 +73,23 @@ const osThreadAttr_t defaultTask_attributes = {
 */
 uint16_t adc_buffer[2] = {0};
 
-/* Set to 1 when DMA completes both conversions. */
-volatile uint8_t adc_done = 0;
+/* Queue for transferring measurements. */
+osMessageQueueId_t measurementQueueHandle;
 
-/* Set to 1 if the ADC reports an error. */
-volatile uint8_t adc_error = 0;
+/* Mutex to protect USART2 transmission. */
+osMutexId_t uartMutexHandle;
+
+/* Handle for the telemetry task. */
+osThreadId_t telemetryTaskHandle;
+
+/* Telemetry task configuration. */
+const osThreadAttr_t telemetryTask_attributes =
+{
+    .name = "telemetryTask",
+    .stack_size = 1024,
+    .priority = (osPriority_t)osPriorityBelowNormal
+};
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,6 +107,11 @@ HAL_StatusTypeDef Monitor_ADC_Start(void);
 
 void Monitor_ADC_Convert(float *temperature,
                          uint32_t *vdda_mv);
+
+static void StartTelemetryTask(void *argument);
+
+static void Monitor_UART_Send(const char *message);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -140,6 +168,14 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
+
+  uartMutexHandle = osMutexNew(NULL);
+
+  if (uartMutexHandle == NULL)
+  {
+      Error_Handler();
+  }
+
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -152,6 +188,18 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+
+  measurementQueueHandle = osMessageQueueNew(
+      8,
+      sizeof(monitor_measurement_t),
+      NULL
+  );
+
+  if (measurementQueueHandle == NULL)
+  {
+      Error_Handler();
+  }
+
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -160,6 +208,18 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+
+  telemetryTaskHandle = osThreadNew(
+      StartTelemetryTask,
+      NULL,
+      &telemetryTask_attributes
+  );
+
+  if (telemetryTaskHandle == NULL)
+  {
+      Error_Handler();
+  }
+
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -406,9 +466,6 @@ HAL_StatusTypeDef Monitor_ADC_Init(void)
 /* Start one ADC sequence using DMA. */
 HAL_StatusTypeDef Monitor_ADC_Start(void)
 {
-    adc_done = 0;
-    adc_error = 0;
-
     return HAL_ADC_Start_DMA(
         &hadc1,
         (uint32_t *)adc_buffer,
@@ -422,7 +479,13 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1)
     {
-        adc_done = 1;
+    	if (defaultTaskHandle != NULL)
+		{
+			osThreadFlagsSet(
+				defaultTaskHandle,
+				MONITOR_ADC_DONE_FLAG
+			);
+		}
     }
 }
 
@@ -432,7 +495,13 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1)
     {
-        adc_error = 1;
+    	if (defaultTaskHandle != NULL)
+		{
+			osThreadFlagsSet(
+				defaultTaskHandle,
+				MONITOR_ADC_ERROR_FLAG
+			);
+		}
     }
 }
 
@@ -466,6 +535,92 @@ void Monitor_ADC_Convert(float *temperature,
         );
 }
 
+static void Monitor_UART_Send(const char *message)
+{
+    if (message == NULL)
+    {
+        return;
+    }
+
+    /* Wait until UART is available. */
+    if (osMutexAcquire(
+            uartMutexHandle,
+            osWaitForever) == osOK)
+    {
+        /* Transmit the message. */
+        HAL_UART_Transmit(
+            &huart2,
+            (uint8_t *)message,
+            (uint16_t)strlen(message),
+            200
+        );
+
+        /* Release UART for other tasks. */
+        osMutexRelease(uartMutexHandle);
+    }
+}
+
+static void StartTelemetryTask(void *argument)
+{
+    monitor_measurement_t measurement;
+
+    char tx_buffer[128];
+
+    const char startup_msg[] =
+        "\r\nSTM32 Real-Time System Monitor\r\n"
+        "ADC + DMA + FreeRTOS + UART\r\n"
+        "Multitasking initialized.\r\n\r\n";
+
+    Monitor_UART_Send(startup_msg);
+
+    for (;;)
+    {
+        /*
+         * Wait for a measurement from Sensor Task.
+         */
+        if (osMessageQueueGet(
+                measurementQueueHandle,
+                &measurement,
+                NULL,
+                osWaitForever) == osOK)
+        {
+            /*
+             * Convert temperature into tenths
+             * of a degree.
+             */
+            int32_t temp_tenths =
+                (int32_t)(measurement.temperature_c
+                          * 10.0f);
+
+            int32_t temp_abs =
+                (temp_tenths < 0) ?
+                -temp_tenths : temp_tenths;
+
+            /*
+             * Format the telemetry message.
+             */
+            int len = snprintf(
+                tx_buffer,
+                sizeof(tx_buffer),
+                "TEMP=%s%ld.%ld C, VDDA=%lu mV\r\n",
+                (temp_tenths < 0) ? "-" : "",
+                (long)(temp_abs / 10),
+                (long)(temp_abs % 10),
+                (unsigned long)measurement.vdda_mv
+            );
+
+            /*
+             * Transmit only if formatting succeeded.
+             */
+            if ((len > 0) &&
+                ((size_t)len < sizeof(tx_buffer)))
+            {
+                Monitor_UART_Send(tx_buffer);
+            }
+        }
+    }
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -478,120 +633,133 @@ void Monitor_ADC_Convert(float *temperature,
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-	float temperature = 0.0f;
-	uint32_t vdda_mv = 0;
 
-	char tx_buffer[128];
-
-	const char startup_msg[] =
-		"\r\nSTM32 Real-Time System Monitor\r\n"
-		"ADC + DMA + FreeRTOS + UART\r\n"
-		"System initialized.\r\n\r\n";
-
-	HAL_UART_Transmit(
-		&huart2,
-		(uint8_t *)startup_msg,
-		sizeof(startup_msg) - 1U,
-		1000
-	);
+	monitor_measurement_t measurement;
 
 	for (;;)
 	{
-		/* Start one ADC conversion sequence. */
-		if (Monitor_ADC_Start() != HAL_OK)
-		{
-			const char error_msg[] =
-				"ERROR: ADC start failed\r\n";
+	    /*
+	     * Clear any previous ADC notification flags.
+	     */
+	    osThreadFlagsClear(
+	        MONITOR_ADC_DONE_FLAG |
+	        MONITOR_ADC_ERROR_FLAG
+	    );
 
-			HAL_UART_Transmit(
-				&huart2,
-				(uint8_t *)error_msg,
-				sizeof(error_msg) - 1U,
-				100
-			);
+	    /*
+	     * Start ADC acquisition using DMA.
+	     */
+	    if (Monitor_ADC_Start() != HAL_OK)
+	    {
+	        Monitor_UART_Send(
+	            "ERROR: ADC start failed\r\n"
+	        );
 
-			osDelay(1000);
-			continue;
-		}
+	        osDelay(1000);
+	        continue;
+	    }
 
-		/* Wait for DMA completion, with a timeout. */
-		uint32_t start_tick = osKernelGetTickCount();
+	    /*
+	     * Wait for DMA completion or ADC error.
+	     *
+	     * Timeout = 100 RTOS ticks.
+	     */
+	    uint32_t flags = osThreadFlagsWait(
+	        MONITOR_ADC_DONE_FLAG |
+	        MONITOR_ADC_ERROR_FLAG,
+	        osFlagsWaitAny,
+	        100
+	    );
 
-		while ((adc_done == 0U) &&
-			   (adc_error == 0U) &&
-			   ((osKernelGetTickCount() - start_tick) < 100U))
-		{
-			osDelay(1);
-		}
+	    /*
+	     * Check whether the wait failed or timed out.
+	     */
+	    if ((flags & osFlagsError) != 0U)
+	    {
+	        HAL_ADC_Stop_DMA(&hadc1);
 
-		/* Handle timeout or ADC error. */
-		if ((adc_done == 0U) || (adc_error != 0U))
-		{
-			HAL_ADC_Stop_DMA(&hadc1);
+	        Monitor_UART_Send(
+	            "ERROR: ADC notification timeout\r\n"
+	        );
 
-			const char error_msg[] =
-				"ERROR: ADC timeout or conversion error\r\n";
+	        osDelay(1000);
+	        continue;
+	    }
 
-			HAL_UART_Transmit(
-				&huart2,
-				(uint8_t *)error_msg,
-				sizeof(error_msg) - 1U,
-				100
-			);
+	    /*
+	     * Check whether the ADC reported an error.
+	     */
+	    if ((flags & MONITOR_ADC_ERROR_FLAG) != 0U)
+	    {
+	        HAL_ADC_Stop_DMA(&hadc1);
 
-			osDelay(1000);
-			continue;
-		}
+	        Monitor_UART_Send(
+	            "ERROR: ADC conversion failed\r\n"
+	        );
 
-		/* Conversion is complete. Stop the one-shot DMA. */
-		HAL_ADC_Stop_DMA(&hadc1);
+	        osDelay(1000);
+	        continue;
+	    }
 
-		/* Convert ADC counts into temperature and VDDA. */
-		Monitor_ADC_Convert(
-			&temperature,
-			&vdda_mv
-		);
+	    /*
+	     * Check that DMA completed successfully.
+	     */
+	    if ((flags & MONITOR_ADC_DONE_FLAG) != 0U)
+	    {
+	        /*
+	         * Stop the completed one-shot DMA.
+	         */
+	        HAL_ADC_Stop_DMA(&hadc1);
 
-		/*
-		 * Convert temperature into tenths of a degree.
-		 * Avoid floating-point printf dependencies.
-		 */
-		int32_t temp_tenths =
-			(int32_t)(temperature * 10.0f);
+	        /*
+	         * Convert raw ADC values.
+	         */
+	        Monitor_ADC_Convert(
+	            &measurement.temperature_c,
+	            &measurement.vdda_mv
+	        );
 
-		int32_t temp_abs =
-			(temp_tenths < 0) ?
-			-temp_tenths : temp_tenths;
+	        /*
+	         * Check for invalid reference measurement.
+	         */
+	        if (measurement.vdda_mv == 0U)
+	        {
+	            Monitor_UART_Send(
+	                "ERROR: Invalid VREFINT reading\r\n"
+	            );
+	        }
+	        else
+	        {
+	            /*
+	             * Send measurement to Telemetry Task.
+	             */
+	            if (osMessageQueuePut(
+	                    measurementQueueHandle,
+	                    &measurement,
+	                    0,
+	                    10) != osOK)
+	            {
+	                Monitor_UART_Send(
+	                    "ERROR: Measurement queue full\r\n"
+	                );
+	            }
+	        }
 
-		/* Prepare the telemetry message. */
-		int len = snprintf(
-			tx_buffer,
-			sizeof(tx_buffer),
-			"TEMP=%s%ld.%ld C, VDDA=%lu mV\r\n",
-			(temp_tenths < 0) ? "-" : "",
-			(long)(temp_abs / 10),
-			(long)(temp_abs % 10),
-			(unsigned long)vdda_mv
-		);
+	        /*
+	         * Toggle onboard LED.
+	         */
+	        HAL_GPIO_TogglePin(
+	            LD2_GPIO_Port,
+	            LD2_Pin
+	        );
+	    }
 
-		/* Transmit only when formatting succeeded. */
-		if ((len > 0) &&
-			((size_t)len < sizeof(tx_buffer)))
-		{
-			HAL_UART_Transmit(
-				&huart2,
-				(uint8_t *)tx_buffer,
-				(uint16_t)len,
-				100
-			);
-		}
-
-		/* Toggle onboard LED to show the task is alive. */
-		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-
-		/* Wait one second before the next measurement. */
-		osDelay(1000);
+	    /*
+	     * Wait one second before next acquisition.
+	     */
+	    osDelay(1000);
 	}
+
   /* USER CODE END 5 */
 }
 
